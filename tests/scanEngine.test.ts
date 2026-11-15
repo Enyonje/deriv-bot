@@ -110,7 +110,7 @@ describe("scan engine", () => {
             for (const p of fresh) h.engine.handleMessage({ msg_type: "proposal", req_id: p.req_id, error: { message: "Trading is not offered for this duration." } });
         }
         const row = h.snap().markets!.find((m) => m.symbol === "frxXAUUSD")!;
-        assert.match(row.excluded ?? "", /repeated price errors/);
+        assert.match(row.excluded ?? "", /repeated pricing errors/);
         assert.notEqual(h.snap().phase, "halted"); // XAG still available
     });
 

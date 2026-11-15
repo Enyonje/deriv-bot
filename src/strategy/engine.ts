@@ -1,6 +1,8 @@
 import { RiskManager, type RiskStats } from "./risk";
 import type { BotSettings } from "./settings";
 import { EmaRsiStrategy, type IndicatorView, type Side } from "./strategy";
+import { analyseMarket } from "../agents/market-intelligence";
+import { evaluateStrategies } from "../agents/strategy-agent";
 
 export type Phase =
     | "stopped"
@@ -24,7 +26,7 @@ export interface TradeRecord {
     stake: number;
     buyPrice: number | null;
     profit: number | null;
-    result: "pending" | "open" | "won" | "lost" | "unknown";
+    result: "pending" | "open" | "won" | "lost" | "breakeven" | "unknown";
     reason: string;
     executionLatencyMs?: number;
 }
@@ -88,23 +90,21 @@ interface Pending {
     tradeId?: number;
 }
 
-const REQUEST_TIMEOUT_MS = 10_000; // Hardened timeout for high-speed execution
+const REQUEST_TIMEOUT_MS = 10_000;
 const MAX_CONSECUTIVE_API_ERRORS = 3;
 const MAX_TRADES_KEPT = 100;
-const maxPrice =
-    s.stake * (1 + s.maxSlippagePct / 100); // Tighter slippage control for institutional edge
 
 const EMPTY_STATS: RiskStats = {
     pnl: 0,
     trades: 0,
     wins: 0,
     losses: 0,
+    breakevenTrades: 0,
     consecutiveLosses: 0,
     winRate: null,
     currentStake: 0,
     maxDrawdown: 0,
 };
-
 
 export const EMPTY_SNAPSHOT: BotSnapshot = {
     phase: "stopped",
@@ -115,8 +115,8 @@ export const EMPTY_SNAPSHOT: BotSnapshot = {
 };
 
 /**
- * Institutional-Grade Algorithmic Trading Engine.
- * Features strict risk circuit-breakers, execution latency tracking, and slippage guards.
+ * Trading engine with market-analysis agents, risk controls,
+ * execution monitoring, and slippage protection.
  */
 export class TradingEngine implements BotEngine {
     private phase: Phase = "warming_up";
@@ -134,6 +134,12 @@ export class TradingEngine implements BotEngine {
     private cooldownUntil = 0;
     private apiErrors = 0;
     private lastSignal: { side: Side; reason: string; timestamp: number } | null = null;
+
+    /** Rolling live-price history consumed by the market-analysis agents. */
+    private marketHistory: number[] = [];
+
+    /** Prevents repeated entries while one persistent agent signal remains active. */
+    private agentSignalArmed = true;
 
     constructor(private readonly deps: EngineDeps) {
         this.strategy = new EmaRsiStrategy(deps.settings);
@@ -170,19 +176,33 @@ export class TradingEngine implements BotEngine {
 
     start() {
         this.deps.log(
-            `🚀 Institutional Engine Active on ${this.deps.symbol}: Stake ${this.deps.settings.stake} ${this.deps.currency}, ` +
-            `${this.deps.settings.durationTicks} ticks, EMA ${this.deps.settings.fastPeriod}/${this.deps.settings.slowPeriod}.`,
+            `🚀 Trading Engine Active on ${this.deps.symbol}: Stake ${this.deps.settings.stake} ${this.deps.currency}, ` +
+            `${this.deps.settings.durationTicks} ticks. Agent-driven CALL/PUT execution enabled.`,
         );
-        this.notifyTelemetry("bot_started", { symbol: this.deps.symbol, stake: this.deps.settings.stake });
+
+        this.notifyTelemetry("bot_started", {
+            symbol: this.deps.symbol,
+            stake: this.deps.settings.stake,
+        });
+
         this.emit();
     }
 
     stop() {
         this.enabled = false;
-        if (this.phase !== "halted" && this.pending.size === 0 && this.openContractId === null) {
+
+        if (
+            this.phase !== "halted" &&
+            this.pending.size === 0 &&
+            this.openContractId === null
+        ) {
             this.phase = "stopped";
         }
-        this.deps.log("🛑 Stop requested. Gracefully settling open positions; no new entries will be queued.");
+
+        this.deps.log(
+            "🛑 Stop requested. Gracefully settling open positions; no new entries will be queued.",
+        );
+
         this.notifyTelemetry("bot_stop_requested", {});
         this.emit();
     }
@@ -191,6 +211,7 @@ export class TradingEngine implements BotEngine {
         this.phase = "halted";
         this.haltReason = reason;
         this.enabled = false;
+
         this.deps.log(`🚨 CRITICAL HALT: ${reason}`);
         this.notifyTelemetry("bot_halted", { reason });
         this.emit();
@@ -198,19 +219,32 @@ export class TradingEngine implements BotEngine {
 
     private finishCycle() {
         if (this.phase === "halted") return;
+
         if (!this.enabled) {
             this.phase = "stopped";
             return;
         }
-        if (this.cooldownUntil > this.now()) this.phase = "cooldown";
-        else this.phase = this.strategy.ready ? "idle" : "warming_up";
+
+        if (this.cooldownUntil > this.now()) {
+            this.phase = "cooldown";
+        } else {
+            // Agent trading depends on its own market history, not the
+            // legacy EMA/RSI strategy's readiness state.
+            this.phase = this.marketHistory.length >= 30 ? "idle" : "warming_up";
+        }
     }
 
     private recordApiError(message: string) {
         this.apiErrors++;
-        this.deps.log(`⚠️ API Warning: ${message} (Streak: ${this.apiErrors}/${MAX_CONSECUTIVE_API_ERRORS})`);
+
+        this.deps.log(
+            `⚠️ API Warning: ${message} (Streak: ${this.apiErrors}/${MAX_CONSECUTIVE_API_ERRORS})`,
+        );
+
         if (this.apiErrors >= MAX_CONSECUTIVE_API_ERRORS) {
-            this.halt(`Safety Circuit Tripped: Repeated API communication failures. Last error: ${message}`);
+            this.halt(
+                `Safety Circuit Tripped: Repeated API communication failures. Last error: ${message}`,
+            );
         } else {
             this.finishCycle();
         }
@@ -218,37 +252,65 @@ export class TradingEngine implements BotEngine {
 
     handleMessage(msg: Record<string, any>) {
         if (msg.msg_type === "tick") {
-            if (typeof msg.req_id === "number" && msg.req_id >= 4_000_000) return;
+            if (
+                typeof msg.req_id === "number" &&
+                msg.req_id >= 4_000_000
+            ) {
+                return;
+            }
+
             const quote = Number(msg.tick?.quote);
-            if (Number.isFinite(quote)) this.onTick(quote);
+
+            if (Number.isFinite(quote)) {
+                this.onTick(quote);
+            }
+
             return;
         }
 
-        const reqId: number | undefined = msg.req_id ?? msg.echo_req?.req_id;
-        const pending = reqId !== undefined ? this.pending.get(reqId) : undefined;
+        const reqId: number | undefined =
+            msg.req_id ?? msg.echo_req?.req_id;
+
+        const pending =
+            reqId !== undefined ? this.pending.get(reqId) : undefined;
 
         if (msg.error) {
             if (pending && reqId !== undefined) {
                 this.pending.delete(reqId);
+
                 if (pending.kind === "buy") {
-                    this.trades = this.trades.filter((t) => t.id !== pending.tradeId);
+                    this.trades = this.trades.filter(
+                        (trade) => trade.id !== pending.tradeId,
+                    );
                 }
-                this.recordApiError(`${pending.kind} protocol rejected: ${msg.error.message ?? "unknown error"}`);
+
+                this.recordApiError(
+                    `${pending.kind} protocol rejected: ${msg.error.message ?? "unknown error"}`,
+                );
+
                 this.emit();
             }
+
             return;
         }
 
         switch (msg.msg_type) {
             case "proposal":
-                if (pending?.kind === "proposal" && reqId !== undefined) this.onProposal(reqId, msg.proposal);
+                if (pending?.kind === "proposal" && reqId !== undefined) {
+                    this.onProposal(reqId, msg.proposal);
+                }
                 break;
+
             case "buy":
-                if (pending?.kind === "buy" && reqId !== undefined) this.onBuy(reqId, pending, msg.buy);
+                if (pending?.kind === "buy" && reqId !== undefined) {
+                    this.onBuy(reqId, pending, msg.buy);
+                }
                 break;
+
             case "proposal_open_contract":
                 this.onContractUpdate(msg);
                 break;
+
             default:
                 break;
         }
@@ -257,91 +319,201 @@ export class TradingEngine implements BotEngine {
     onConnectionLost() {
         if (this.phase === "proposing") {
             this.pending.clear();
-            this.deps.log("Network dropped during quote proposal. Abandoned cycle.");
+
+            this.deps.log(
+                "Network dropped during quote proposal. Abandoned cycle.",
+            );
+
             this.finishCycle();
         } else if (this.phase === "buying") {
-            for (const p of this.pending.values()) {
-                const trade = this.trades.find((t) => t.id === p.tradeId);
-                if (trade) trade.result = "unknown";
+            for (const pending of this.pending.values()) {
+                const trade = this.trades.find(
+                    (item) => item.id === pending.tradeId,
+                );
+
+                if (trade) {
+                    trade.result = "unknown";
+                }
             }
+
             this.pending.clear();
-            this.halt("FATAL: Network severed during order settlement. Verify open contracts directly on Deriv terminal.");
+
+            this.halt(
+                "FATAL: Network severed during order settlement. Verify open contracts directly on Deriv terminal.",
+            );
         }
+
         this.emit();
     }
 
     onConnectionRestored() {
         if (this.openContractId !== null) {
-            this.deps.log("Network re-established. Re-subscribing telemetry feed for active contract.");
+            this.deps.log(
+                "Network re-established. Re-subscribing telemetry feed for active contract.",
+            );
+
             this.subscribeToContract(this.openContractId);
         }
     }
 
     private onTick(price: number) {
-        const signal = this.strategy.update(price);
-        const t = this.now();
-        this.checkTimeouts(t);
+        // Keep the legacy indicator stream current.
+        this.strategy.update(price);
 
-        if (this.phase === "warming_up" && this.strategy.ready) {
+        // Feed live prices into the market-analysis pipeline.
+        this.marketHistory.push(price);
+
+        if (this.marketHistory.length > 200) {
+            this.marketHistory.shift();
+        }
+
+        const timestamp = this.now();
+
+        this.checkTimeouts(timestamp);
+
+        const analysis = analyseMarket({
+            symbol: this.deps.symbol,
+            prices: this.marketHistory,
+            timestamp,
+        });
+
+        const agentSignals = evaluateStrategies(analysis);
+        const selected = agentSignals[0] ?? null;
+
+        if (
+            this.phase === "warming_up" &&
+            analysis.observations >= 30
+        ) {
             this.phase = "idle";
-            this.deps.log("Indicators calibrated and primed. Activating high-frequency listening loop.");
-        }
-        if (this.phase === "cooldown" && t >= this.cooldownUntil) this.phase = "idle";
 
-        if (signal && this.phase === "idle" && this.enabled) {
-            this.requestProposal(signal.side, signal.reason);
+            this.deps.log(
+                `Market-analysis agent ready on ${this.deps.symbol}: ${analysis.regime} regime, ${analysis.observations} observations.`,
+            );
         }
+
+        if (
+            this.phase === "cooldown" &&
+            timestamp >= this.cooldownUntil
+        ) {
+            this.phase = "idle";
+        }
+
+        // Avoid repeatedly entering on the same persistent signal.
+        if (!selected) {
+            this.agentSignalArmed = true;
+        }
+
+        if (
+            selected &&
+            (selected.side === "CALL" || selected.side === "PUT") &&
+            Number.isFinite(selected.confidence) &&
+            selected.confidence >= 0 &&
+            selected.confidence <= 100 &&
+            this.phase === "idle" &&
+            this.enabled &&
+            this.agentSignalArmed
+        ) {
+            this.agentSignalArmed = false;
+
+            const reason =
+                `${selected.strategyId} · ${selected.confidence.toFixed(0)}% confidence · ` +
+                `${analysis.regime} market: ${selected.reason}`;
+
+            this.deps.log(
+                `🧠 Market-analysis agent approved a ${selected.side} candidate: ${reason}`,
+            );
+
+            this.requestProposal(selected.side, reason);
+        }
+
         this.emit();
     }
 
-    private checkTimeouts(t: number) {
-        for (const [reqId, p] of [...this.pending]) {
-            if (t - p.at <= REQUEST_TIMEOUT_MS) continue;
+    private checkTimeouts(timestamp: number) {
+        for (const [reqId, pending] of [...this.pending]) {
+            if (timestamp - pending.at <= REQUEST_TIMEOUT_MS) {
+                continue;
+            }
+
             this.pending.delete(reqId);
-            if (p.kind === "proposal") {
-                this.recordApiError("Proposal request timed out waiting for gateway response.");
+
+            if (pending.kind === "proposal") {
+                this.recordApiError(
+                    "Proposal request timed out waiting for gateway response.",
+                );
             } else {
-                const trade = this.trades.find((x) => x.id === p.tradeId);
-                if (trade) trade.result = "unknown";
-                this.halt("Order execution timed out. Check account ledger before reactivating.");
+                const trade = this.trades.find(
+                    (item) => item.id === pending.tradeId,
+                );
+
+                if (trade) {
+                    trade.result = "unknown";
+                }
+
+                this.halt(
+                    "Order execution timed out. Check account ledger before reactivating.",
+                );
             }
         }
     }
 
     private requestProposal(side: Side, reason: string) {
         const riskCheck = this.risk.check();
+
         if (!riskCheck.ok) {
-            this.halt(`Risk Management Lockout: ${riskCheck.reason}`);
+            this.halt(
+                `Risk Management Lockout: ${riskCheck.reason}`,
+            );
             return;
         }
-        const s = this.deps.settings;
+
+        const settings = this.deps.settings;
         const reqId = this.nextReqId++;
+
         const sent = this.deps.send({
             proposal: 1,
-            amount: s.stake,
+            amount: settings.stake,
             basis: "stake",
             contract_type: side,
             currency: this.deps.currency,
-            duration: s.durationTicks,
+            duration: settings.durationTicks,
             duration_unit: "t",
             underlying_symbol: this.deps.symbol,
             req_id: reqId,
         });
 
         if (!sent) {
-            this.deps.log("Execution aborted: WebSocket pipe is offline.");
+            this.deps.log(
+                "Execution aborted: WebSocket pipe is offline.",
+            );
             return;
         }
 
-        this.pending.set(reqId, { kind: "proposal", at: this.now() });
+        this.pending.set(reqId, {
+            kind: "proposal",
+            at: this.now(),
+        });
+
         this.phase = "proposing";
-        this.lastSignal = { side, reason, timestamp: this.now() };
-        this.deps.log(`⚡ Signal Confirmed [${side}]: ${reason}. Fetching institutional pricing quote…`);
+
+        this.lastSignal = {
+            side,
+            reason,
+            timestamp: this.now(),
+        };
+
+        this.deps.log(
+            `⚡ Signal Confirmed [${side}]: ${reason}. Fetching pricing quote…`,
+        );
     }
 
-    private onProposal(reqId: number, proposal: Record<string, any> | undefined) {
+    private onProposal(
+        reqId: number,
+        proposal: Record<string, any> | undefined,
+    ) {
         this.pending.delete(reqId);
-        const s = this.deps.settings;
+
+        const settings = this.deps.settings;
 
         if (!this.enabled) {
             this.finishCycle();
@@ -351,13 +523,20 @@ export class TradingEngine implements BotEngine {
 
         const id = proposal?.id;
         const ask = Number(proposal?.ask_price);
+
         if (typeof id !== "string" || !Number.isFinite(ask)) {
-            this.recordApiError("Received malformed pricing payload from broker socket.");
+            this.recordApiError(
+                "Received malformed pricing payload from broker socket.",
+            );
+
             this.emit();
             return;
         }
 
-        // Strict slippage tolerance check
+        // Strict slippage tolerance check.
+        const maxPrice =
+            settings.stake * (1 + settings.maxSlippagePct / 100);
+
         if (
             !Number.isFinite(ask) ||
             ask <= 0 ||
@@ -366,41 +545,64 @@ export class TradingEngine implements BotEngine {
             this.deps.log(
                 `Quote rejected: ask ${ask} exceeds maximum permitted price ${maxPrice.toFixed(2)}.`,
             );
+
             this.finishCycle();
             this.emit();
             return;
         }
 
-        const signal = this.lastSignal ?? { side: "CALL" as Side, reason: "", timestamp: this.now() };
+        const signal = this.lastSignal ?? {
+            side: "CALL" as Side,
+            reason: "",
+            timestamp: this.now(),
+        };
+
         const quotedPayout = Number(proposal?.payout);
-        const nowTime = this.now();
+        const currentTime = this.now();
 
         const trade: TradeRecord = {
             id: this.nextTradeId++,
             symbol: this.deps.symbol,
-            payout: Number.isFinite(quotedPayout) ? quotedPayout : null,
+            payout: Number.isFinite(quotedPayout)
+                ? quotedPayout
+                : null,
             contractId: null,
-            openedAt: nowTime,
+            openedAt: currentTime,
             side: signal.side,
-            stake: s.stake,
+            stake: settings.stake,
             buyPrice: null,
             profit: null,
             result: "pending",
             reason: signal.reason,
-            executionLatencyMs: nowTime - signal.timestamp,
+            executionLatencyMs: currentTime - signal.timestamp,
         };
 
         const buyReq = this.nextReqId++;
-        const sent = this.deps.send({ buy: id, price: s.stake, req_id: buyReq });
+
+        const sent = this.deps.send({
+            buy: id,
+            price: settings.stake,
+            req_id: buyReq,
+        });
+
         if (!sent) {
-            this.deps.log("Order dispatch failed: WebSocket pipe closed unexpectedly.");
+            this.deps.log(
+                "Order dispatch failed: WebSocket pipe closed unexpectedly.",
+            );
+
             this.finishCycle();
             this.emit();
             return;
         }
 
         this.trades.push(trade);
-        this.pending.set(buyReq, { kind: "buy", at: this.now(), tradeId: trade.id });
+
+        this.pending.set(buyReq, {
+            kind: "buy",
+            at: this.now(),
+            tradeId: trade.id,
+        });
+
         this.phase = "buying";
         this.emit();
     }
@@ -413,7 +615,7 @@ export class TradingEngine implements BotEngine {
         this.pending.delete(reqId);
 
         const trade = this.trades.find(
-            (t) => t.id === pending.tradeId,
+            (item) => item.id === pending.tradeId,
         );
 
         const contractId = Number(buy?.contract_id);
@@ -426,11 +628,14 @@ export class TradingEngine implements BotEngine {
             !Number.isFinite(buyPrice) ||
             buyPrice <= 0
         ) {
-            if (trade) trade.result = "unknown";
+            if (trade) {
+                trade.result = "unknown";
+            }
 
             this.halt(
                 "Invalid buy confirmation. Verify the account ledger before resuming.",
             );
+
             return;
         }
 
@@ -460,40 +665,95 @@ export class TradingEngine implements BotEngine {
     }
 
     private subscribeToContract(contractId: number) {
-        this.deps.send({ proposal_open_contract: 1, contract_id: contractId, subscribe: 1, req_id: this.nextReqId++ });
+        this.deps.send({
+            proposal_open_contract: 1,
+            contract_id: contractId,
+            subscribe: 1,
+            req_id: this.nextReqId++,
+        });
     }
 
     private onContractUpdate(msg: Record<string, any>) {
-        const c = msg.proposal_open_contract;
-        if (!c || this.openContractId === null || Number(c.contract_id) !== this.openContractId) return;
-        if (typeof msg.subscription?.id === "string") this.subscriptionId = msg.subscription.id;
-        if (!(c.is_sold === 1 || c.is_sold === true)) return;
+        const contract = msg.proposal_open_contract;
 
-        const profit = Number(c.profit);
-        const trade = this.trades.find((t) => t.id === this.openTradeId);
-        if (this.subscriptionId) this.deps.send({ forget: this.subscriptionId });
+        if (
+            !contract ||
+            this.openContractId === null ||
+            Number(contract.contract_id) !== this.openContractId
+        ) {
+            return;
+        }
+
+        if (typeof msg.subscription?.id === "string") {
+            this.subscriptionId = msg.subscription.id;
+        }
+
+        if (
+            !(contract.is_sold === 1 || contract.is_sold === true)
+        ) {
+            return;
+        }
+
+        const profit = Number(contract.profit);
+
+        const trade = this.trades.find(
+            (item) => item.id === this.openTradeId,
+        );
+
+        if (this.subscriptionId) {
+            this.deps.send({
+                forget: this.subscriptionId,
+            });
+        }
 
         this.subscriptionId = null;
         this.openContractId = null;
         this.openTradeId = null;
 
         if (!Number.isFinite(profit) || !trade) {
-            this.halt("Settlement payload unreadable. Check portfolio balance directly.");
+            this.halt(
+                "Settlement payload unreadable. Check portfolio balance directly.",
+            );
             return;
         }
 
         trade.profit = profit;
-        trade.result = profit > 0 ? "won" : "lost";
+
+        trade.result =
+            profit > 0
+                ? "won"
+                : profit < 0
+                    ? "lost"
+                    : "breakeven";
+
         this.risk.recordResult(profit);
 
-        const outcomeText = profit > 0 ? "✅ WON" : "❌ LOST";
-        this.deps.log(`${outcomeText} #${trade.contractId} | Net PnL: ${profit >= 0 ? "+" : ""}${profit.toFixed(2)} ${this.deps.currency}`);
-        this.notifyTelemetry("trade_settled", { contractId: trade.contractId, profit, result: trade.result });
+        const outcomeText =
+            profit > 0
+                ? "✅ WON"
+                : profit < 0
+                    ? "❌ LOST"
+                    : "➖ BREAKEVEN";
 
-        this.cooldownUntil = this.now() + this.deps.settings.cooldownSeconds * 1000;
+        this.deps.log(
+            `${outcomeText} #${trade.contractId} | Net PnL: ${profit >= 0 ? "+" : ""}${profit.toFixed(2)} ${this.deps.currency}`,
+        );
+
+        this.notifyTelemetry("trade_settled", {
+            contractId: trade.contractId,
+            profit,
+            result: trade.result,
+        });
+
+        this.cooldownUntil =
+            this.now() + this.deps.settings.cooldownSeconds * 1000;
+
         const riskCheck = this.risk.check();
+
         if (!riskCheck.ok) {
-            this.halt(`Circuit Breaker Triggered: ${riskCheck.reason}`);
+            this.halt(
+                `Circuit Breaker Triggered: ${riskCheck.reason}`,
+            );
             return;
         }
 

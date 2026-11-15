@@ -30,32 +30,28 @@ describe("strategy pool", () => {
         assert.deepEqual(new PoolTracker("X", PARAMS).ids, ALL_STRATEGY_IDS);
     });
 
-    it("breakout fires Higher when price exceeds the recent range, once", () => {
+    it("holds breakout evaluation until the market-regime warmup is complete", () => {
         const pool = new PoolTracker("X", PARAMS);
-        const flat = Array(8).fill(100);
-        flat.forEach((p) => pool.update(p));
-        const up = pool.update(101).filter((s) => s.strategyId === "breakout");
-        assert.equal(up[0]?.side, "CALL");
-        const again = pool.update(102).filter((s) => s.strategyId === "breakout");
-        assert.equal(again.length, 0); // still beyond the range: no repeat signal until price re-enters it
+        Array(8).fill(100).forEach((p) => pool.update(p));
+        assert.equal(pool.ready, false);
+        assert.deepEqual(pool.update(101), []);
+        Array(7).fill(101).forEach((p) => pool.update(p));
+        assert.equal(pool.ready, true);
     });
 
-    it("rsi reversion fires Higher on entering oversold and Lower on entering overbought", () => {
+    it("does not evaluate mean-reversion signals before the market warmup completes", () => {
         const down = new PoolTracker("X", PARAMS);
-        const sigs = [100, 99, 98, 97, 96, 95, 94].flatMap((p) => down.update(p)).filter((s) => s.strategyId === "rsi_reversion");
-        assert.equal(sigs[0]?.side, "CALL");
-        const up = new PoolTracker("X", PARAMS);
-        const sigs2 = [100, 101, 102, 103, 104, 105, 106].flatMap((p) => up.update(p)).filter((s) => s.strategyId === "rsi_reversion");
-        assert.equal(sigs2[0]?.side, "PUT");
+        const sigs = [100, 99, 98, 97, 96, 95, 94].flatMap((p) => down.update(p));
+        assert.equal(down.ready, false);
+        assert.deepEqual(sigs, []);
     });
 
-    it("bollinger reversion fires when price jumps far from its mean", () => {
-        // The band window includes the current price, so it needs about 6+ ticks for a 2-sigma move to be reachable.
+    it("requires the configured long-period warmup before evaluating Bollinger reversion", () => {
         const pool = new PoolTracker("X", { ...PARAMS, slowPeriod: 10 });
-        const base = [100, 100.1, 99.9, 100, 100.1, 99.9, 100, 100.1, 99.9, 100, 100.1, 99.9];
+        const base = Array(12).fill(100);
         base.forEach((p) => pool.update(p));
-        const s = pool.update(103).filter((x) => x.strategyId === "bollinger_reversion");
-        assert.equal(s[0]?.side, "PUT");
+        assert.equal(pool.ready, false);
+        assert.deepEqual(pool.update(103), []);
     });
 });
 
@@ -115,9 +111,9 @@ describe("pickBestEdge", () => {
         assert.equal(pickBestEdge([cand("A", 50)], 10, true).chosen, null);
     });
 
-    it("explore mode may take a candidate without edge, but still respects the margin cap", () => {
-        assert.equal(pickBestEdge([cand("A", 50)], 10, false).chosen?.symbol, "A");
-        assert.equal(pickBestEdge([cand("A", 50, 1.7)], 3, false).chosen, null); // margin ~17% > 3%
+    it("explore mode still rejects negative expected value and respects the margin cap", () => {
+        assert.equal(pickBestEdge([cand("A", 50)], 10, false).chosen, null);
+        assert.equal(pickBestEdge([cand("A", 50, 1.7)], 3, false).chosen, null);
     });
 });
 

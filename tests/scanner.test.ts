@@ -61,11 +61,14 @@ describe("win-rate maths", () => {
 });
 
 describe("tracker and settings", () => {
-    it("tracker emits a CALL with a strength on an upward crossover", () => {
+    it("emits an explainable tick-confirmed EMA/RSI signal after warmup", () => {
         const t = new MarketTracker("X", { fastPeriod: 2, slowPeriod: 3, rsiPeriod: 2, rsiOverbought: 95, rsiOversold: 5 });
-        const out = [100, 99.5, 99, 98.5, 98, 97.5, 97, 97.4, 97.9, 98.5, 99.2, 100].map((p) => t.update(p)).filter((s) => s);
-        assert.equal(out[0]?.side, "CALL");
-        assert.ok((out[0]?.strength ?? -1) >= 0);
+        const out = [100, 99.5, 99, 98.5, 98, 97.5, 97, 97.4, 97.9, 98.5, 99.2, 100].map((p) => t.update(p)).filter((s): s is NonNullable<typeof s> => s !== null);
+        const bullish = out.find((signal) => signal.side === "CALL")!;
+        assert.ok(bullish, "bullish crossover should be detected after the reversal");
+        assert.match(bullish.reason, /EMA\/RSI alignment/);
+        assert.ok(bullish.strength >= 0);
+        assert.equal(t.ready, true);
     });
 
     it("validates scan settings", () => {

@@ -1,5 +1,6 @@
 import { houseMarginPct, quoteMetrics, type Quote } from "./quotes";
-import { EmaRsiStrategy, type Side, type StrategyParams } from "./strategy";
+import { Rsi } from "./indicators";
+import type { Side, StrategyParams } from "./strategy";
 
 export interface ScanSignal {
     side: Side;
@@ -10,32 +11,49 @@ export interface ScanSignal {
 
 /** One market's indicator state. Feed it that market's ticks. */
 export class MarketTracker {
-    private readonly strategy: EmaRsiStrategy;
-    private readonly alpha: number;
+    private readonly rsi: Rsi;
+    private readonly prices: number[] = [];
+    private fastEma: number | null = null;
+    private slowEma: number | null = null;
+    private ticks = 0;
     private vol: number | null = null;
     private last: number | null = null;
+    private lastSignalSide: Side | null = null;
 
-    constructor(readonly symbol: string, params: StrategyParams) {
-        this.strategy = new EmaRsiStrategy(params);
-        this.alpha = 2 / (params.slowPeriod + 1);
+    constructor(readonly symbol: string, private readonly params: StrategyParams) {
+        this.rsi = new Rsi(params.rsiPeriod);
     }
 
     update(price: number): ScanSignal | null {
+        if (!Number.isFinite(price) || price <= 0) return null;
         if (this.last !== null) {
             const move = Math.abs(price - this.last);
-            this.vol = this.vol === null ? move : this.vol + this.alpha * (move - this.vol);
+            this.vol = this.vol === null ? move : this.vol + (2 / (this.params.slowPeriod + 1)) * (move - this.vol);
         }
         this.last = price;
+        this.ticks++;
+        this.prices.push(price);
+        if (this.prices.length > 100) this.prices.shift();
 
-        const signal = this.strategy.update(price);
-        if (!signal) return null;
-        const slow = this.strategy.view().slow;
-        const strength = slow !== null && this.vol !== null && this.vol > 0 ? Math.abs(price - slow) / this.vol : 0;
-        return { ...signal, strength };
+        const fastAlpha = 2 / (this.params.fastPeriod + 1);
+        const slowAlpha = 2 / (this.params.slowPeriod + 1);
+        this.fastEma = this.fastEma === null ? price : fastAlpha * price + (1 - fastAlpha) * this.fastEma;
+        this.slowEma = this.slowEma === null ? price : slowAlpha * price + (1 - slowAlpha) * this.slowEma;
+        const rsi = this.rsi.update(price);
+        if (!this.ready || rsi === null || this.fastEma === null || this.slowEma === null) return null;
+
+        const momentum = price - this.prices[this.prices.length - 6];
+        let side: Side | null = null;
+        if (this.fastEma > this.slowEma && momentum > 0 && rsi > 50 && rsi < this.params.rsiOverbought) side = "CALL";
+        if (this.fastEma < this.slowEma && momentum < 0 && rsi < 50 && rsi > this.params.rsiOversold) side = "PUT";
+        if (!side || side === this.lastSignalSide) return null;
+        this.lastSignalSide = side;
+        const strength = this.slowEma > 0 && this.vol !== null && this.vol > 0 ? Math.abs(price - this.slowEma) / this.vol : 0;
+        return { side, reason: `Tick-confirmed EMA/RSI alignment (${side}; RSI ${rsi.toFixed(1)})`, strength };
     }
 
     get ready(): boolean {
-        return this.strategy.ready;
+        return this.ticks >= this.params.slowPeriod && this.prices.length >= 6;
     }
 
     get lastPrice(): number | null {
@@ -202,15 +220,7 @@ export function pickBestEdge(candidates: Candidate[], maxMarginPct: number, requ
         r.expectedValue >= 0; // Strict non-negative Expected Value gate
 
     const ok = rows
-        .filter(
-            (r) =>
-                r.margin !== null &&
-                Number.isFinite(r.margin) &&
-                r.margin <= maxMarginPct &&
-                r.expectedValue !== null &&
-                Number.isFinite(r.expectedValue) &&
-                r.expectedValue >= 0
-        )
+        .filter(qualifies)
         .sort(
             (a, b) =>
                 (b.expectedValue as number) - (a.expectedValue as number) ||

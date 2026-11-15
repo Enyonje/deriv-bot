@@ -35,7 +35,7 @@ export function getSessionMaxAgeSeconds(): number {
 }
 
 /** Reads and validates configuration at request time. */
-export function getConfig(): DerivConfig {
+export function getApiBase(): string {
     const apiBase = required("DERIV_API_BASE").replace(/\/+$/, "");
     let parsed: URL;
     try {
@@ -44,6 +44,12 @@ export function getConfig(): DerivConfig {
         throw new ConfigError("DERIV_API_BASE must be a valid URL");
     }
     if (parsed.protocol !== "https:") throw new ConfigError("DERIV_API_BASE must use https");
+    return apiBase;
+}
+
+/** Reads and validates server-side fallback credentials at request time. */
+export function getConfig(): DerivConfig {
+    const apiBase = getApiBase();
 
     const accountType = required("DERIV_ACCOUNT_TYPE").toLowerCase() as AccountType;
     if (!ACCOUNT_TYPES.includes(accountType)) {
@@ -66,7 +72,3 @@ export function getConfig(): DerivConfig {
     };
 }
 
-/** Convenience helper matching route imports */
-export function getApiBase(): string {
-    return getConfig().apiBase;
-}

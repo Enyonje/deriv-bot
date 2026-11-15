@@ -14,7 +14,7 @@ export interface BotSettings {
     maxConsecutiveLosses: number;
     maxTrades: number;
     cooldownSeconds: number;
-    /** Enables adaptive Kelly Criterion sizing for dynamic compounding */
+    /** Reserved for a future validated sizing model; dynamic staking is currently disabled. */
     useDynamicStaking: boolean;
     /** Minimum allowed stake floor when dynamic scaling triggers */
     minStake: number;
@@ -38,7 +38,7 @@ export const DEFAULT_SETTINGS: BotSettings = {
     maxConsecutiveLosses: 3,
     maxTrades: 50,
     cooldownSeconds: 5,
-    useDynamicStaking: true,
+    useDynamicStaking: false,
     minStake: 0.5,
     maxStake: 5.0,
     maxSlippagePct: 0.05, // 0.05% strict institutional limit

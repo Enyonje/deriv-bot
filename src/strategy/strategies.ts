@@ -1,6 +1,5 @@
 import { Rsi } from "./indicators";
 import {
-    EmaRsiStrategy,
     type Side,
     type Signal,
     type StrategyParams
@@ -263,49 +262,29 @@ class MarketAnalyzer {
  */
 class EmaRsiPool implements PoolStrategy {
     readonly id = "ema_rsi" as const;
+    private readonly rsi: Rsi;
+    private lastSignalSide: Side | null = null;
 
-    private readonly inner: EmaRsiStrategy;
-
-    constructor(params: StrategyParams) {
-        this.inner = new EmaRsiStrategy(params);
+    constructor(private readonly params: StrategyParams) {
+        this.rsi = new Rsi(params.rsiPeriod);
     }
 
-    update(
-        price: number,
-        market: MarketContext
-    ): Signal | null {
+    update(price: number, market: MarketContext): Signal | null {
+        const rsi = this.rsi.update(price);
+        if (rsi === null || market.volatilityRatio > 2) return null;
 
-        if (
-            market.regime !== "bullish" &&
-            market.regime !== "bearish"
-        ) {
-            this.inner.update(price);
-            return null;
+        if (market.regime === "bullish" && market.emaFast > market.emaSlow && market.momentum > 0 && rsi > 50 && rsi <= this.params.rsiOverbought) {
+            if (this.lastSignalSide === "CALL") return null;
+            this.lastSignalSide = "CALL";
+            return { side: "CALL", reason: `Trend-confirmed EMA/RSI bullish alignment (RSI ${rsi.toFixed(1)})` };
         }
-
-        if (market.volatilityRatio > 2) {
-            this.inner.update(price);
-            return null;
+        if (market.regime === "bearish" && market.emaFast < market.emaSlow && market.momentum < 0 && rsi < 50 && rsi >= this.params.rsiOversold) {
+            if (this.lastSignalSide === "PUT") return null;
+            this.lastSignalSide = "PUT";
+            return { side: "PUT", reason: `Trend-confirmed EMA/RSI bearish alignment (RSI ${rsi.toFixed(1)})` };
         }
-
-        const signal = this.inner.update(price);
-
-        if (!signal) return null;
-
-        if (
-            signal.side === "CALL" &&
-            market.regime !== "bullish"
-        ) return null;
-
-        if (
-            signal.side === "PUT" &&
-            market.regime !== "bearish"
-        ) return null;
-
-        return {
-            side: signal.side,
-            reason: `Trend-confirmed EMA/RSI signal. Regime: ${market.regime}`
-        };
+        if (market.regime === "ranging" || market.regime === "unknown") this.lastSignalSide = null;
+        return null;
     }
 }
 
@@ -731,26 +710,22 @@ export class PoolTracker {
 
         this.currentMarket = market;
 
-        if (!this.ready) {
-            return [];
-        }
-
-        if (market.regime === "volatile") {
-            return [];
-        }
-
         const output: PoolSignal[] = [];
+        const marketIsVolatile = market.regime === "volatile";
 
+        // Keep each strategy's indicator state warm from the first tick.
+        // Suppress emitted signals until the shared market analyzer is ready.
         for (const strategy of this.strategies) {
-
             const signal = strategy.update(price, market);
+            if (!signal || !this.ready || marketIsVolatile) continue;
 
-            if (!signal) continue;
-
+            const meanReversion = strategy.id === "rsi_reversion" || strategy.id === "bollinger_reversion";
+            const regimeConfirmed = meanReversion
+                ? market.regime === "ranging"
+                : market.efficiency >= 0.20;
             const confidence = calculateConfidence([
                 market.volatilityRatio < 2,
-                market.efficiency >= 0.20,
-                market.regime !== "volatile",
+                regimeConfirmed,
                 signal.side === "CALL"
                     ? market.momentum > 0
                     : market.momentum < 0

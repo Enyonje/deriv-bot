@@ -67,6 +67,7 @@ export function useDerivWebSocket(options: UseDerivWebSocketOptions = {}) {
     const [status, setStatus] = useState<ConnectionStatus>("disconnected");
     const [balance, setBalance] = useState<Balance | null>(null);
     const [tick, setTick] = useState<Tick | null>(null);
+    const [priceHistory, setPriceHistory] = useState<number[]>([]);
     const [logs, setLogs] = useState<string[]>([]);
     const [accountType, setAccountType] = useState<SessionResponse["accountType"] | null>(null);
     const [symbol, setSymbol] = useState<string | null>(null);
@@ -112,6 +113,7 @@ export function useDerivWebSocket(options: UseDerivWebSocketOptions = {}) {
             symbolRef.current = next;
             setSymbol(next);
             setTick(null);
+            setPriceHistory([]);
 
             const ws = wsRef.current;
             if (!ws || ws.readyState !== WebSocket.OPEN) return true;
@@ -253,6 +255,7 @@ export function useDerivWebSocket(options: UseDerivWebSocketOptions = {}) {
                         if (Number.isFinite(quote)) {
                             const pip = Number(msg.tick?.pip_size);
                             setTick({ quote, pipSize: Number.isInteger(pip) && pip >= 0 ? pip : null });
+                            setPriceHistory((previous) => [...previous.slice(-999), quote]);
                         }
                         break;
                     }
@@ -292,6 +295,7 @@ export function useDerivWebSocket(options: UseDerivWebSocketOptions = {}) {
         setStatus("disconnected");
         setBalance(null);
         setTick(null);
+        setPriceHistory([]);
         log("Disconnected.");
     }, [clearTimers, teardownSocket, log]);
 
@@ -307,5 +311,5 @@ export function useDerivWebSocket(options: UseDerivWebSocketOptions = {}) {
         };
     }, [autoConnect, connect, clearTimers, teardownSocket]);
 
-    return { status, balance, tick, logs, accountType, symbol, connect, disconnect, send, addMessageListener, log, changeSymbol };
+    return { status, balance, tick, priceHistory, logs, accountType, symbol, connect, disconnect, send, addMessageListener, log, changeSymbol };
 }

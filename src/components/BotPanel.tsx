@@ -33,12 +33,10 @@ const GROUPS: {
     fields: Field<Exclude<keyof BotSettings, "useDynamicStaking">>[];
 }[] = [
         {
-            title: "Trade & Dynamic Staking",
+            title: "Trade & Execution",
             fields: [
                 { key: "stake", label: "Stake per trade", step: "0.01" },
                 { key: "durationTicks", label: "Duration (ticks, single market)", step: "1" },
-                { key: "minStake", label: "Minimum dynamic stake", step: "0.01" },
-                { key: "maxStake", label: "Maximum dynamic stake", step: "0.01" },
                 { key: "maxSlippagePct", label: "Maximum slippage (%)", step: "0.01" },
             ],
         },
@@ -136,10 +134,6 @@ export default function BotPanel({
     const [values, setValues] = useState(() => toStrings(DEFAULT_SETTINGS));
 
     // Boolean settings must remain booleans, not strings or numbers.
-    const [dynamicStaking, setDynamicStaking] = useState<boolean>(
-        DEFAULT_SETTINGS.useDynamicStaking
-    );
-
     const [scanValues, setScanValues] = useState(() => toStrings(DEFAULT_SCAN_SETTINGS));
     const [auto, setAuto] = useState(false);
     const [unit, setUnit] = useState<DurationUnit>(DEFAULT_SCAN_SETTINGS.durationUnit);
@@ -194,7 +188,7 @@ export default function BotPanel({
             ])
         ),
 
-        useDynamicStaking: dynamicStaking,
+        useDynamicStaking: false,
     }) as BotSettings;
 
     const parseScan = (): ScanSettings => {
@@ -498,21 +492,10 @@ export default function BotPanel({
                             {g.title}
                         </legend>
 
-                        {g.title === "Trade & Dynamic Staking" && (
-
-                            <label className="flex items-center gap-2 text-sm text-slate-700 mb-3">
-
-                                <input
-                                    type="checkbox"
-                                    checked={dynamicStaking}
-                                    onChange={(e) => setDynamicStaking(e.target.checked)}
-                                    disabled={running}
-                                />
-
-                                Enable dynamic staking (Kelly-based sizing)
-
-                            </label>
-
+                        {g.title === "Trade & Execution" && (
+                            <p className="mb-3 rounded-lg bg-amber-50 p-3 text-xs text-amber-800">
+                                Fixed stake sizing is active. Dynamic Kelly sizing remains disabled until a payout-adjusted model is independently validated.
+                            </p>
                         )}
 
                         <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">

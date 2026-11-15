@@ -197,6 +197,9 @@ export class ScanEngine implements BotEngine {
 
     start() {
         const s = this.deps.scan;
+        this.decision = this.adaptive
+            ? "No strategy has proven itself yet; collecting live observations and paper-trading evidence."
+            : "Scanner is warming up and waiting for a qualifying signal.";
         this.deps.log(
             `🚀 Institutional ${this.adaptive ? "Adaptive" : "Auto-select"} Scanner Active on ${this.deps.symbols.length} market(s): ` +
             `Stake ${this.deps.settings.stake} ${this.deps.currency}, ${s.duration}${s.durationUnit}, margin cap ${s.maxMarginPct}%.`,

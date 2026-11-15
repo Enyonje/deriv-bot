@@ -29,7 +29,7 @@ const SCAN: ScanSettings = {
     maxMarginPct: 6,
     minSampleTrades: 5,
 };
-const DOWN_THEN_UP = [100, 99.5, 99, 98.5, 98, 97.5, 97, 97.4, 97.9, 98.5, 99.2, 100];
+const DOWN_THEN_UP = [100, 99.5, 99, 98.5, 98, 97.5, 97, 97.4, 97.9, 98.5, 98.8, 99.2, 99.4, 99.8, 100];
 const SYMBOLS = ["frxXAUUSD", "frxXAGUSD"];
 
 const record = (wins: number, n: number): boolean[] => Array.from({ length: n }, (_, i) => i < wins);
@@ -77,7 +77,7 @@ describe("adaptive engine", () => {
         const h = harness();
         for (const p of DOWN_THEN_UP) h.tick(0, p);
         assert.equal(h.proposals().length, 0);
-        assert.match(h.snap().decision ?? "", /no strategy has proven itself/i);
+        assert.match(h.snap().decision ?? "", /awaiting statistical confidence threshold/i);
         assert.ok(h.snap().strategies && h.snap().strategies!.length > 0);
         assert.match(h.snap().evidenceNote ?? "", /paper trades/);
     });
@@ -100,8 +100,8 @@ describe("adaptive engine", () => {
         const buy = h.sent.find((r) => r.buy);
         assert.ok(buy, "purchase sent");
         assert.equal(buy!.price, SETTINGS.stake);
-        assert.match(h.snap().decision ?? "", /via EMA crossover \+ RSI/);
-        assert.match(h.snap().trades[0]!.reason, /EMA crossover \+ RSI/);
+        assert.match(h.snap().decision ?? "", /via Adaptive EMA \+ RSI/);
+        assert.match(h.snap().trades[0]!.reason, /Adaptive EMA \+ RSI/);
     });
 
     it("refuses a strategy whose cautious win rate is below break-even, even with a large sample", () => {
@@ -110,12 +110,12 @@ describe("adaptive engine", () => {
         assert.equal(h.proposals().length, 0);
     });
 
-    it("explore mode trades once the sample is big enough, even without proven edge", () => {
+    it("explore mode does not bypass a negative expected-value gate", () => {
         const h = harness({ scan: { requireEvidence: false }, shadow: seed({ "frxXAUUSD|ema_rsi": record(6, 10) }) });
         for (const p of DOWN_THEN_UP) h.tick(0, p);
         assert.equal(h.proposals().length, 2);
         quoteAll(h);
-        assert.ok(h.sent.some((r) => r.buy), "explore mode bought");
+        assert.equal(h.sent.some((r) => r.buy), false, "negative expected value must block purchase");
     });
 
     it("explore mode still waits for the minimum number of paper trades", () => {
@@ -127,7 +127,11 @@ describe("adaptive engine", () => {
     it("runs paper trades on every tick without spending anything", () => {
         const h = harness();
         // A wobbling series gives every strategy something to react to.
-        for (let i = 0; i < 80; i++) h.tick(i % 2, 100 + Math.sin(i / 3) * 2 + (i % 7) * 0.1);
+        for (let i = 0; i < 40; i++) {
+            const price = 100 + Math.sin(i / 3) * 2 + (i % 7) * 0.1;
+            h.tick(0, price);
+            h.tick(1, price);
+        }
         const total = h.snap().strategies!.reduce((a, r) => a + r.n, 0);
         assert.ok(total > 0, "paper trades settled");
         assert.equal(h.sent.filter((r) => r.buy).length, 0, "no real purchase was made");
